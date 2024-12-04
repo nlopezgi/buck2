@@ -90,6 +90,7 @@ mod fbcode {
                 .into_iter()
                 .filter_map(|e| {
                     let message_key = e.trace_id().unwrap().hash();
+                    println!("send_messages_now: message_key {:?}", message_key);
                     Self::encode_message(e, false).map(|bytes| scribe_client::Message {
                         category: self.category.clone(),
                         message: bytes,
@@ -552,11 +553,11 @@ mod fbcode {
                                     Some(buck2_data::analysis_start::Target::AnonTarget(_anon)) => None, // TODO
                                     Some(buck2_data::analysis_start::Target::DynamicLambda(_owner)) => None, // TODO
                                 };
-                                let mut label_str = "".to_owned() + label.as_ref().unwrap();
-                                label_str = label_str.replace("root//:","//");
-                                //label_str = label_str.replace("//:","/");
-                                //label_str = "//".to_owned() + &label_str;
-                                //println!("Analysis event label {:?}", label_str);
+                                // Mangle the label to remove prefixes not supported in Bazel labels
+                                let mut label_str = "".to_owned() + &label.clone().unwrap_or("UNKOWN".to_owned());
+                                label_str = label_str.replace("root//","//");
+                                label_str = label_str.replace("prelude//","//");
+                                label_str = label_str.replace("toolchains//","//");
                                 match label {
                                     None => {},
                                     Some(label) => {
@@ -628,10 +629,11 @@ mod fbcode {
                                         // flush the target completed map.
                                         for ((label, config), actions) in target_actions.into_iter() {
                                             //println!("flush the target completed map");
+                                            // Mangle the label to remove prefixes not supported in Bazel labels
                                             let mut label_str = "".to_owned() + &label.clone();
-                                            label_str = label_str.replace("root//:","//");
-                                            //label_str = label_str.replace("//:","/");
-                                            //label_str = "//".to_owned() + &label_str;
+                                            label_str = label_str.replace("root//","//");
+                                            label_str = label_str.replace("prelude//","//");
+                                            label_str = label_str.replace("toolchains//","//");
                                             let success = actions.iter().all(|(_, success)| *success);
                                             let children: Vec<_> = actions.into_iter().map(|(id, _)| id).collect();
                                             let bes_event = build_event_stream::BuildEvent {
@@ -666,12 +668,7 @@ mod fbcode {
                                                 event: Some(bazel_event),
                                             };
                                         }
-
-
-
                                         // InvocationAttemptFinished Send event
-
-
                                         let inv_finished_event = v1::build_event::InvocationAttemptFinished {
                                             details: None,
                                             invocation_status: Some(
@@ -844,10 +841,11 @@ mod fbcode {
                                         },
                                     },
                                 }.map(|label| format!("{}:{}", label.package, label.name));
+                                // Mangle the label to remove prefixes not supported in Bazel labels
                                 let mut label_str = "".to_owned() + &label.clone().unwrap_or("UNKOWN".to_owned());
-                                label_str = label_str.replace("root//:","//");
-                                //label_str = label_str.replace("//:","/");
-                                //label_str = "//".to_owned() + &label_str;
+                                label_str = label_str.replace("root//","//");
+                                label_str = label_str.replace("prelude//","//");
+                                label_str = label_str.replace("toolchains//","//");
                                 let action_id = BuildEventId {id: Some(build_event_id::Id::ActionCompleted(build_event_id::ActionCompletedId {
                                     configuration: configuration.clone(),
                                     label: label_str,
