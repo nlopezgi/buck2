@@ -353,9 +353,14 @@ mod fbcode {
 
     use futures::Stream;
     use futures::StreamExt;
+    use tonic::transport::channel::ClientTlsConfig;
+    use tonic::transport::Certificate;
     use tonic::transport::Channel;
     use tonic::Request;
 
+    use std::time::Duration;
+
+    use tokio::fs::OpenOptions;
     use tokio::runtime::Builder;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -366,7 +371,9 @@ mod fbcode {
     use bazel_event_publisher_proto::google::devtools::build::v1::OrderedBuildEvent;
     use bazel_event_publisher_proto::google::devtools::build::v1::publish_build_event_client::PublishBuildEventClient;
     use bazel_event_publisher_proto::google::devtools::build::v1::PublishBuildToolEventStreamRequest;
+    use bazel_event_publisher_proto::google::devtools::build::v1::PublishLifecycleEventRequest;
     use bazel_event_publisher_proto::google::devtools::build::v1::StreamId;
+    use bazel_event_publisher_proto::google::devtools::build::v1::BuildStatus;
 
     use prost;
     use prost::Message;
@@ -384,35 +391,52 @@ mod fbcode {
     }
 
     async fn connect_build_event_server() -> anyhow::Result<PublishBuildEventClient<Channel>> {
-        let uri = std::env::var("BES_URI")?.parse()?;
-        let channel = Channel::builder(uri);
+        let address = std::env::var("BES_URI")?;
+        let uri = address.parse().context("connect_build_event_server - Invalid address")?;
+        println!("connect_build_event_server - uri: {:?}", uri);
+        let mut channel = Channel::builder(uri);
+        println!("connect_build_event_server built channel");
         // TODO: enable TLS and handle API token
-        // let tls_config = ClientTlsConfig::new();
-        // channel = channel.tls_config(tls_config)?;
+        let mut tls_config = ClientTlsConfig::new();
+        let data = tokio::fs::read("/Users/nlopez/src/ef/.secrets/opal/engflow.includesprivatekey.pem")
+            .await
+            .with_context(|| format!("Error reading `{}`", "/Users/nlopez/src/ef/.secrets/opal/engflow.includesprivatekey.pem"))?;
+        tls_config = tls_config.ca_certificate(Certificate::from_pem(data));
+        channel = channel.tls_config(tls_config.clone())?;
+        println!("connect_build_event_server connecting...");
         channel
             .connect()
             .await
-            .context("connecting to Bazel event stream gRPC server")?;
+            .with_context(|| format!("Error connecting to `{}`", address))?;
+        println!("connect_build_event_server channel connected");
         let client = PublishBuildEventClient::connect(channel)
             .await
             .context("creating Bazel event stream gRPC client")?;
+        println!("connect_build_event_server Bazel event stream gRPC client created");
         Ok(client)
     }
 
-    fn buck_to_bazel_events<S: Stream<Item = BuckEvent>>(events: S) -> impl Stream<Item = v1::BuildEvent> {
+    fn buck_to_bazel_events<S: Stream<Item = BuckEvent>>(events: S, client: PublishBuildEventClient<Channel>) -> impl Stream<Item = v1::BuildEvent> {
         let mut target_actions: HashMap<(String, String), Vec<(BuildEventId, bool)>> = HashMap::new();
         stream! {
             for await event in events {
-                println!("EVENT {:?} {:?}", event.event.trace_id, event);
+                // println!("EVENT {:?} {:?}", event.event.trace_id, event);
                 match event.data() {
                     buck2_data::buck_event::Data::SpanStart(start) => {
-                        println!("START {:?}", start);
+                        //println!("START {:?}", start);
+                        //println!("START **");
                         match start.data.as_ref() {
-                            None => {},
+                            None => {
+                                //println!("Entered NONE 1");
+                            },
                             Some(buck2_data::span_start_event::Data::Command(command)) => {
                                 match command.data.as_ref() {
-                                    None => {},
+                                    None => {
+                                       //println!("Entered NONE 2");
+                                    },
                                     Some(buck2_data::command_start::Data::Build(BuildCommandStart {})) => {
+                                        println!("Entered Some(buck2_data...))");
+
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::Started(build_event_stream::build_event_id::BuildStartedId {})) }),
                                             children: vec![],
@@ -433,15 +457,94 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
+
+
+                                        // SEND ENQUEUED LIFECYCLE EVENT
+                                        let enqueued_event = v1::build_event::BuildEnqueued {
+                                            details: None,
+                                        };
+
+                                        let build_enqueued_event = v1::BuildEvent {
+                                            event: Some(v1::build_event::Event::BuildEnqueued(enqueued_event)),
+                                            event_time: Some(event.timestamp().into()),
+                                        };
+                                        println!("Enqueued {:?}", build_enqueued_event);
+
+                                        let lifecycle_request = Request::new(PublishLifecycleEventRequest{
+                                            build_event: Some(OrderedBuildEvent {
+                                                sequence_number: 1,
+                                                event: Some(build_enqueued_event),
+                                                stream_id: Some(StreamId{
+                                                    build_id: event.event.trace_id.clone(),
+                                                    // I think it should not be set but its being requested.
+                                                    invocation_id: event.event.trace_id.clone(),
+                                                    // hardcode CONTROLLER
+                                                    component: 1,
+                                                }),
+                                            }),
+                                            //service_level: Some(PublishLifecycleEventRequest::ServiceLevel::INTERACTIVE),
+                                            service_level: 1,
+                                            project_id: "default".to_owned(),
+                                            check_preceding_lifecycle_events_present: false,
+                                            notification_keywords: [].to_vec(),
+                                            stream_timeout: None,
+                                        });
+
+                                        let mut client = client.clone();
+                                        let response = client.publish_lifecycle_event(lifecycle_request).await;
+                                        // END ENQUEUED LIFECYCLE EVENT
+
+
+                                        // SEND InvocationAttemptStarted event
+
+                                        let inv_started_event = v1::build_event::InvocationAttemptStarted {
+                                            attempt_number: 1,
+                                            details: None,
+                                        };
+
+                                        let invocation_started_event = v1::BuildEvent {
+                                            event: Some(v1::build_event::Event::InvocationAttemptStarted(inv_started_event)),
+                                            event_time: Some(event.timestamp().into()),
+                                        };
+                                        println!("inv_started_event {:?}", invocation_started_event);
+
+                                        let lifecycle_request = Request::new(PublishLifecycleEventRequest{
+                                            build_event: Some(OrderedBuildEvent {
+                                                sequence_number: 1,
+                                                event: Some(invocation_started_event),
+                                                stream_id: Some(StreamId{
+                                                    build_id: event.event.trace_id.clone(),
+                                                    // I think it should not be set but its being requested.
+                                                    invocation_id: event.event.trace_id.clone(),
+                                                    // hardcode CONTROLLER
+                                                    component: 1,
+                                                }),
+                                            }),
+                                            //service_level: Some(PublishLifecycleEventRequest::ServiceLevel::INTERACTIVE),
+                                            service_level: 1,
+                                            project_id: "default".to_owned(),
+                                            check_preceding_lifecycle_events_present: false,
+                                            notification_keywords: [].to_vec(),
+                                            stream_timeout: None,
+                                        });
+
+                                        let mut client = client.clone();
+                                        let response = client.publish_lifecycle_event(lifecycle_request).await;
+                                        // END InvocationAttemptStarted event
+
+                                        //println!("START {:?}", bazel_event);
                                         yield v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
                                         };
                                     },
-                                    Some(_) => {},
+                                    Some(_) => {
+                                        //println!("Entered SOME 2");
+                                    },
                                 }
                             },
                             Some(buck2_data::span_start_event::Data::Analysis(analysis)) => {
+                                //println!("Analysis event");
                                 let label = match analysis.target.as_ref() {
                                     None => None,
                                     Some(buck2_data::analysis_start::Target::StandardTarget(label)) =>
@@ -449,12 +552,17 @@ mod fbcode {
                                     Some(buck2_data::analysis_start::Target::AnonTarget(_anon)) => None, // TODO
                                     Some(buck2_data::analysis_start::Target::DynamicLambda(_owner)) => None, // TODO
                                 };
+                                let mut label_str = "".to_owned() + label.as_ref().unwrap();
+                                label_str = label_str.replace("root//:","//");
+                                //label_str = label_str.replace("//:","/");
+                                //label_str = "//".to_owned() + &label_str;
+                                //println!("Analysis event label {:?}", label_str);
                                 match label {
                                     None => {},
                                     Some(label) => {
                                         let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::TargetConfigured(build_event_id::TargetConfiguredId {
-                                                label: label.clone(),
+                                                label: label_str.clone(),
                                                 aspect: "".to_owned(),
                                             })) }),
                                             children: vec![],
@@ -469,6 +577,7 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
+                                        //println!("Analysis label1 {:?}", bazel_event);
                                         yield v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
@@ -480,7 +589,7 @@ mod fbcode {
                                             })) }),
                                             children: vec![
                                                 build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::TargetConfigured(bazel_event_publisher_proto::build_event_stream::build_event_id::TargetConfiguredId {
-                                                    label: label,
+                                                    label: label_str.clone(),
                                                     aspect: "".to_owned(),
                                                 }))},
                                             ],
@@ -493,6 +602,7 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
+                                        //println!("Analysis label2 {:?}", bazel_event);
                                         yield v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
@@ -500,24 +610,33 @@ mod fbcode {
                                     },
                                 }
                             },
-                            Some(_) => {},
+                            Some(_) => {
+                                //println!("Entered SOME 1");
+                            },
                         }
                     },
                     buck2_data::buck_event::Data::SpanEnd(end) => {
-                        println!("END   {:?}", end);
+                        //println!("END   {:?}", end);
                         match end.data.as_ref() {
                             None => {},
                             Some(buck2_data::span_end_event::Data::Command(command)) => {
                                 match command.data.as_ref() {
                                     None => {},
                                     Some(buck2_data::command_end::Data::Build(_build)) => {
+
+
                                         // flush the target completed map.
                                         for ((label, config), actions) in target_actions.into_iter() {
+                                            //println!("flush the target completed map");
+                                            let mut label_str = "".to_owned() + &label.clone();
+                                            label_str = label_str.replace("root//:","//");
+                                            //label_str = label_str.replace("//:","/");
+                                            //label_str = "//".to_owned() + &label_str;
                                             let success = actions.iter().all(|(_, success)| *success);
                                             let children: Vec<_> = actions.into_iter().map(|(id, _)| id).collect();
                                             let bes_event = build_event_stream::BuildEvent {
                                                 id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::TargetCompleted(build_event_id::TargetCompletedId {
-                                                    label: label,
+                                                    label: label_str.clone(),
                                                     configuration: Some(build_event_id::ConfigurationId { id: config }),
                                                     aspect: "".to_owned(),
                                                 })) }),
@@ -540,13 +659,126 @@ mod fbcode {
                                                 type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                                 value: bes_event.encode_to_vec(),
                                             });
+                                            //println!("flush event {:?}", bazel_event);
+
                                             yield v1::BuildEvent {
                                                 event_time: Some(event.timestamp().into()),
                                                 event: Some(bazel_event),
                                             };
                                         }
 
-                                        let bes_event = build_event_stream::BuildEvent {
+
+
+                                        // InvocationAttemptFinished Send event
+
+
+                                        let inv_finished_event = v1::build_event::InvocationAttemptFinished {
+                                            details: None,
+                                            invocation_status: Some(
+                                                if command.is_success {
+                                                    BuildStatus {
+                                                        result: 1,
+                                                        final_invocation_id: event.event.trace_id.clone(),
+                                                        build_tool_exit_code: Some(1),
+                                                        error_message: "".to_string(),
+                                                        details: None,
+                                                    }
+                                                } else {
+                                                    BuildStatus {
+                                                        result: 2,
+                                                        final_invocation_id: event.event.trace_id.clone(),
+                                                        build_tool_exit_code: Some(2),
+                                                        error_message: "".to_string(),
+                                                        details: None,
+                                                    }
+                                                }),
+                                        };
+
+                                        let build_inv_finished_event = v1::BuildEvent {
+                                            event: Some(v1::build_event::Event::InvocationAttemptFinished(inv_finished_event)),
+                                            event_time: Some(event.timestamp().into()),
+                                        };
+                                        //println!("INV Finished ev {:?}", build_inv_finished_event);
+
+                                        let lifecycle_request = Request::new(PublishLifecycleEventRequest{
+                                            build_event: Some(OrderedBuildEvent {
+                                                sequence_number: 2,
+                                                event: Some(build_inv_finished_event),
+                                                stream_id: Some(StreamId{
+                                                    build_id: event.event.trace_id.clone(),
+                                                    // I think it should not be set but its being requested.
+                                                    invocation_id: event.event.trace_id.clone(),
+                                                    // hardcode CONTROLLER
+                                                    component: 1,
+                                                }),
+                                            }),
+                                            service_level: 1,
+                                            project_id: "default".to_owned(),
+                                            check_preceding_lifecycle_events_present: false,
+                                            notification_keywords: [].to_vec(),
+                                            stream_timeout: None,
+                                        });
+
+                                        let mut client = client.clone();
+                                        let response = client.publish_lifecycle_event(lifecycle_request).await;
+
+                                        // END InvocationAttemptFinished Send event
+
+
+                                        // BuildFinished Send event
+
+                                        let finished_event = v1::build_event::BuildFinished {
+                                            details: None,
+                                            status: Some(
+                                                if command.is_success {
+                                                    BuildStatus {
+                                                        result: 1,
+                                                        final_invocation_id: event.event.trace_id.clone(),
+                                                        build_tool_exit_code: Some(1),
+                                                        error_message: "".to_string(),
+                                                        details: None,
+                                                    }
+                                                } else {
+                                                    BuildStatus {
+                                                        result: 2,
+                                                        final_invocation_id: event.event.trace_id.clone(),
+                                                        build_tool_exit_code: Some(2),
+                                                        error_message: "".to_string(),
+                                                        details: None,
+                                                    }
+                                                }),
+                                        };
+
+                                        let build_finished_event = v1::BuildEvent {
+                                            event: Some(v1::build_event::Event::BuildFinished(finished_event)),
+                                            event_time: Some(event.timestamp().into()),
+                                        };
+                                        //println!("Finished {:?}", build_finished_event);
+
+                                        let lifecycle_request = Request::new(PublishLifecycleEventRequest{
+                                            build_event: Some(OrderedBuildEvent {
+                                                sequence_number: 2,
+                                                event: Some(build_finished_event),
+                                                stream_id: Some(StreamId{
+                                                    build_id: event.event.trace_id.clone(),
+                                                    // I think it should not be set but its being requested.
+                                                    invocation_id: event.event.trace_id.clone(),
+                                                    // hardcode CONTROLLER
+                                                    component: 1,
+                                                }),
+                                            }),
+                                            service_level: 1,
+                                            project_id: "default".to_owned(),
+                                            check_preceding_lifecycle_events_present: false,
+                                            notification_keywords: [].to_vec(),
+                                            stream_timeout: None,
+                                        });
+
+                                        let mut client = client.clone();
+                                        let response = client.publish_lifecycle_event(lifecycle_request).await;
+                                        // END BuildFinished Send event
+
+                                        /*let bes_event = build_event_stream::BuildEvent {
                                             id: Some(build_event_stream::BuildEventId { id: Some(build_event_stream::build_event_id::Id::BuildFinished(build_event_stream::build_event_id::BuildFinishedId {})) }),
                                             children: vec![],
                                             last_message: true,
@@ -575,10 +807,11 @@ mod fbcode {
                                             type_url: "type.googleapis.com/build_event_stream.BuildEvent".to_owned(),
                                             value: bes_event.encode_to_vec(),
                                         });
+                                        println!("END {:?}", bazel_event);
                                         yield v1::BuildEvent {
                                             event_time: Some(event.timestamp().into()),
                                             event: Some(bazel_event),
-                                        };
+                                        };*/
                                         break;
                                     },
                                     Some(_) => {},
@@ -611,9 +844,13 @@ mod fbcode {
                                         },
                                     },
                                 }.map(|label| format!("{}:{}", label.package, label.name));
+                                let mut label_str = "".to_owned() + &label.clone().unwrap_or("UNKOWN".to_owned());
+                                label_str = label_str.replace("root//:","//");
+                                //label_str = label_str.replace("//:","/");
+                                //label_str = "//".to_owned() + &label_str;
                                 let action_id = BuildEventId {id: Some(build_event_id::Id::ActionCompleted(build_event_id::ActionCompletedId {
                                     configuration: configuration.clone(),
-                                    label: label.clone().unwrap_or("UNKOWN".to_owned()),
+                                    label: label_str,
                                     primary_output: "UNKNOWN".to_owned(),
                                 }))};
                                 let mnemonic = action.name.as_ref().map(|name| name.category.clone()).unwrap_or("UNKNOWN".to_owned());
@@ -689,11 +926,16 @@ mod fbcode {
                                     event: Some(bazel_event),
                                 };
                             },
+
+
+
+
                             Some(_) => {},
                         }
                     },
                     buck2_data::buck_event::Data::Instant(instant) => {
-                        println!("INST  {:?}", instant);
+                        //println!("INST  {:?}", instant);
+                        //println!("INST  **");
                     },
                     buck2_data::buck_event::Data::Record(record) => {
                         println!("REC   {:?}", record);
@@ -704,6 +946,8 @@ mod fbcode {
     }
 
     fn stream_build_tool_events<S: Stream<Item = v1::BuildEvent>>(trace_id: String, events: S) -> impl Stream<Item = PublishBuildToolEventStreamRequest> {
+        println!("stream_build_tool_events - invocation_id: {:?}", trace_id);
+
         stream::iter(1..)
             .zip(events)
             .map(move |(sequence_number, event)| {
@@ -714,36 +958,43 @@ mod fbcode {
                         stream_id: Some(StreamId {
                             build_id: trace_id.clone(),
                             invocation_id: trace_id.clone(),
-                            component: 0,
+                            component: 1,
                         }),
                         sequence_number,
                         event: Some(event),
                     }),
-                    project_id: "12341234".to_owned(), // TODO: needed
+                    project_id: "default".to_owned(), // TODO: needed
                 }
             })
     }
 
     async fn event_sink_loop(recv: UnboundedReceiver<Vec<BuckEvent>>) -> anyhow::Result<()> {
+        println!("event_sink_loop starts");
         let mut handlers: HashMap<String, (UnboundedSender<BuckEvent>, tokio::task::JoinHandle<anyhow::Result<()>>)> = HashMap::new();
+        println!("connect_build_event_server starting");
         let client = connect_build_event_server().await?;
+        println!("connect_build_event_server done");
         let mut recv = UnboundedReceiverStream::new(recv)
             .flat_map(|v|stream::iter(v));
+        println!("Starting loop for events");
         while let Some(event) = recv.next().await {
             let dbg_trace_id = event.event.trace_id.clone();
-            println!("event_sink_loop event {:?}", &dbg_trace_id);
+            // println!("event_sink_loop event {:?}", &dbg_trace_id);
+            // println!("event_sink_loop event TRACE ID **");
             if let Some((send, _)) = handlers.get(&event.event.trace_id) {
-                println!("event_sink_loop redirect {:?}", &dbg_trace_id);
+                // println!("event_sink_loop redirect {:?}", &dbg_trace_id);
+                //println!("event_sink_loop redirect {:?}", &event.event.trace_id);
                 send.send(event).unwrap_or_else(|e| println!("build event send failed {:?}", e));
             } else {
-                println!("event_sink_loop new handler {:?}", event.event.trace_id);
+                // println!("event_sink_loop new handler {:?}", event.event.trace_id);
                 let (send, recv) = mpsc::unbounded_channel::<BuckEvent>();
                 let mut client = client.clone();
                 let dbg_trace_id = dbg_trace_id.clone();
                 let trace_id = event.event.trace_id.clone();
                 let handler = tokio::spawn(async move {
                     let recv = UnboundedReceiverStream::new(recv);
-                    let request = Request::new(stream_build_tool_events(trace_id, buck_to_bazel_events(recv)));
+                    let bazel_event = buck_to_bazel_events(recv, client.clone());
+                    let mut request = Request::new(stream_build_tool_events(trace_id, bazel_event));
                     println!("new handler request {:?}", &dbg_trace_id);
                     let response = client.publish_build_tool_event_stream(request).await?;
                     println!("new handler response {:?}", &dbg_trace_id);
