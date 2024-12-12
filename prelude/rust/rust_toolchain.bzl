@@ -55,6 +55,8 @@ rust_toolchain_attrs = {
     "rustc_coverage_flags": provider_field(typing.Any, default = ("-Cinstrument-coverage",)),
     # Extra env variables that should be made available to the rustdoc executable.
     "rustdoc_env": provider_field(dict[str, typing.Any], default = {}),
+    # Extra env variables that should be made available to the rustc executable.
+    "rustc_env": provider_field(dict[str, typing.Any], default = {}),
     # Extra flags for rustdoc invocations
     "rustdoc_flags": provider_field(list[typing.Any], default = []),
     # When you `buck test` a library, also compile and run example code in its
